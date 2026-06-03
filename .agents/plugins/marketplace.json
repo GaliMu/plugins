@@ -1,7 +1,7 @@
 {
-  "name": "openai-curated",
+  "name": "galimu-codex-plugins-fork",
   "interface": {
-    "displayName": "Codex official"
+    "displayName": "Galimu plugins"
   },
   "plugins": [
     {
