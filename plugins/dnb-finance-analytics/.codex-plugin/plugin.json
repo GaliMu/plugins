@@ -1,6 +1,6 @@
 {
   "name": "dnb-finance-analytics",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Credit origination, portfolio management, company reports, and workflow tools from D&B Finance Analytics.",
   "author": {
     "name": "Dun & Bradstreet",
@@ -22,6 +22,7 @@
     "credit-origination"
   ],
   "apps": "./.app.json",
+  "skills": "./skills/",
   "interface": {
     "displayName": "D&B Finance Analytics",
     "shortDescription": "Credit origination, portfolio risk, company reports, and folder workflows.",
