@@ -90,13 +90,15 @@ const container = figma.createAutoLayout("VERTICAL", {
 });
 
 slide.appendChild(container);
-container.layoutSizingHorizontal = "FILL";
+container.resize(slide.width - 80, container.height);
 container.layoutSizingVertical = "HUG";
+container.x = 40;
+container.y = 40;
 
 return { createdNodeIds: [container.id] };
 ```
 
-Remember: `layoutSizingHorizontal/Vertical = 'FILL'` must be set **after** `appendChild`.
+Slides are not auto-layout parents, so direct slide children cannot use `FILL`. Give the container an explicit width instead. For nested children, set `FILL` only after appending them to an auto-layout container.
 
 ## Working with components
 
@@ -118,7 +120,7 @@ return { createdNodeIds: [component.id, instance.id] };
 
 Slides have a fixed canvas size (typically 1920x1080). Position content using absolute `x`/`y` coordinates within the slide, or use auto-layout containers to handle positioning automatically.
 
-**Critical: Always set `x`/`y` AFTER `appendChild`.** Setting position before parenting the node to the slide causes unpredictable coordinate offsets. See [slide-gotchas.md](slide-gotchas.md) for details and WRONG/CORRECT examples.
+**Critical: MUST set `x`/`y` AFTER `appendChild` — at every level of nesting.** Setting position before parenting causes a `(−240, −240)` shift because new nodes are silently auto-parented to a slide context at absolute `(240, 240)`. The rule applies to frames inside other frames, not just the slide root. See [slide-gotchas.md](slide-gotchas.md#position-after-appendchild-critical) for the helper pattern (`addFrame` / `addText` / `addRect`) you should use to make the order impossible to write wrong.
 
 Recommended pattern — append first, then configure:
 

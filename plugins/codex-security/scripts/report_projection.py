@@ -4,14 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import re
 from collections import Counter
-from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "informational": 4}
+CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
 REPORTABLE_SEVERITIES = {"critical", "high", "medium", "low"}
 DISPOSITION_LABELS = {
     "reported": "Reported",
@@ -20,20 +18,11 @@ DISPOSITION_LABELS = {
     "not_applicable": "Not applicable",
     "needs_follow_up": "Needs follow-up",
 }
+WRITEUP_REPORT_PATH_RE = re.compile(r"^findings/([a-z0-9][a-z0-9._-]*)/\1\.md$")
 
 
 class ReportProjectionError(ValueError):
     """Raised when a canonical scan cannot be projected into a valid report."""
-
-
-def _load_script(name: str) -> ModuleType:
-    path = Path(__file__).resolve().parent / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(f"codex_security_{name}", path)
-    if spec is None or spec.loader is None:
-        raise ReportProjectionError(f"could not load report helper: {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _text(value: Any, fallback: str) -> str:
@@ -58,6 +47,8 @@ def _escape_markdown_text(value: str) -> str:
 
 
 def _strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
     if not isinstance(value, list):
         return []
     normalized: list[str] = []
@@ -76,41 +67,221 @@ def _link_label(value: Any, fallback: str) -> str:
     return _cell(value) or _cell(fallback)
 
 
+def _deep_report_id(finding: dict[str, Any]) -> str:
+    extensions = finding.get("extensions")
+    if isinstance(extensions, dict):
+        report_id = extensions.get("reportId")
+        if isinstance(report_id, str) and report_id.strip():
+            return report_id
+        ledger_row_id = extensions.get("ledgerRowId")
+        if isinstance(ledger_row_id, str) and ledger_row_id.strip():
+            return ledger_row_id
+    identity = finding.get("identity")
+    if isinstance(identity, dict):
+        instance = identity.get("instance")
+        if isinstance(instance, str) and instance.strip():
+            return instance
+    occurrence_id = finding.get("occurrenceId")
+    return (
+        occurrence_id
+        if isinstance(occurrence_id, str) and occurrence_id.strip()
+        else "Unidentified report"
+    )
+
+
+def _deep_candidate_id(finding: dict[str, Any]) -> str:
+    extensions = finding.get("extensions")
+    if isinstance(extensions, dict):
+        candidate_id = extensions.get("candidateId")
+        if isinstance(candidate_id, str) and candidate_id.strip():
+            return candidate_id
+    return _deep_report_id(finding)
+
+
+def _has_deep_child_metadata(finding: dict[str, Any]) -> bool:
+    extensions = finding.get("extensions")
+    if not isinstance(extensions, dict):
+        return False
+    return any(
+        isinstance(extensions.get(field), str) and extensions[field].strip()
+        for field in ("candidateId", "reportId")
+    )
+
+
+def _uses_deep_presentation(coverage: dict[str, Any], findings: list[dict[str, Any]]) -> bool:
+    if coverage.get("mode") == "deep_repository":
+        return True
+    if coverage.get("mode") != "scoped_path":
+        return False
+    # Scoped deep scans can arrive as scoped_path artifacts. The child ids are
+    # the stable deep-scan signal; ordinary scoped scans do not emit them.
+    return any(_has_deep_child_metadata(finding) for finding in findings)
+
+
+def _deep_title_parts(finding: dict[str, Any]) -> tuple[str, str | None]:
+    title = finding.get("title")
+    if not isinstance(title, str):
+        return "Untitled finding", None
+    normalized = " ".join(title.split())
+    match = re.fullmatch(r"(.+?)\s+\[([^\[\]\n]+)\]", normalized)
+    if match is None:
+        return normalized, None
+    annotation = match.group(2)
+    extensions = finding.get("extensions")
+    recognized_ids = [_deep_report_id(finding)]
+    if isinstance(extensions, dict):
+        ledger_row_id = extensions.get("ledgerRowId")
+        if isinstance(ledger_row_id, str) and ledger_row_id.strip():
+            recognized_ids.append(ledger_row_id)
+    if any(
+        annotation == report_id or annotation.startswith(f"{report_id};")
+        for report_id in recognized_ids
+    ):
+        return match.group(1), annotation
+    return normalized, None
+
+
+def _deep_finding_title(finding: dict[str, Any]) -> str:
+    return _deep_title_parts(finding)[0]
+
+
+def _deep_finding_groups(
+    findings: list[dict[str, Any]], writeup_paths: list[str | None]
+) -> list[list[tuple[int, dict[str, Any], str | None]]]:
+    groups: dict[str, list[tuple[int, dict[str, Any], str | None]]] = {}
+    for number, (finding, report_path) in enumerate(zip(findings, writeup_paths, strict=True), 1):
+        groups.setdefault(_deep_candidate_id(finding), []).append((number, finding, report_path))
+    return list(groups.values())
+
+
+def _deep_group_titles(group: list[tuple[int, dict[str, Any], str | None]]) -> str:
+    titles: list[str] = []
+    for _, finding, _ in group:
+        title = _cell(_deep_finding_title(finding))
+        if title not in titles:
+            titles.append(title)
+    return "<br>".join(titles)
+
+
+def _deep_group_levels(
+    group: list[tuple[int, dict[str, Any], str | None]],
+    field: str,
+    order: dict[str, int],
+) -> str:
+    levels = {finding[field]["level"] for _, finding, _ in group}
+    return "<br>".join(sorted(levels, key=lambda level: order.get(level, len(order))))
+
+
+def _deep_group_report_labels(
+    group: list[tuple[int, dict[str, Any], str | None]],
+) -> list[str]:
+    report_ids = [_deep_report_id(finding) for _, finding, _ in group]
+    report_id_counts = Counter(report_ids)
+    labels = [
+        (_deep_title_parts(finding)[1] if report_id_counts[report_id] > 1 else report_id)
+        or report_id
+        for report_id, (_, finding, _) in zip(report_ids, group, strict=True)
+    ]
+    label_counts = Counter(labels)
+    return [
+        (
+            finding.get("identity", {}).get("instance")
+            if label_counts[label] > 1 and isinstance(finding.get("identity"), dict)
+            else label
+        )
+        or _deep_report_id(finding)
+        for label, (_, finding, _) in zip(labels, group, strict=True)
+    ]
+
+
+def _deep_group_report_links(group: list[tuple[int, dict[str, Any], str | None]]) -> str:
+    labels = _deep_group_report_labels(group)
+    return "<br>".join(
+        f"[{_link_label(label, 'Unidentified report')}](#finding-{number})"
+        for label, (number, _, _) in zip(labels, group, strict=True)
+    )
+
+
+def _deep_group_writeup_links(group: list[tuple[int, dict[str, Any], str | None]]) -> str:
+    labels = _deep_group_report_labels(group)
+    links: list[str] = []
+    for label, (_, _, report_path) in zip(labels, group, strict=True):
+        report_id = _link_label(label, "Unidentified report")
+        links.append(
+            f"[Open {report_id}]({report_path})" if report_path else f"{report_id}: inline below"
+        )
+    return "<br>".join(links)
+
+
+def _writeup_report_path(finding: dict[str, Any]) -> str | None:
+    writeup = finding.get("writeup")
+    if writeup is None:
+        return None
+    if not isinstance(writeup, dict):
+        raise ReportProjectionError("finding writeup must be an object")
+    report_path = writeup.get("reportPath")
+    if not isinstance(report_path, str) or not WRITEUP_REPORT_PATH_RE.fullmatch(report_path):
+        raise ReportProjectionError("finding writeup has an invalid reportPath")
+    return report_path
+
+
+def _hardening_portfolio_path(scan: dict[str, Any]) -> str | None:
+    hardening = scan.get("hardening")
+    if hardening is None:
+        return None
+    if not isinstance(hardening, dict):
+        raise ReportProjectionError("scan hardening must be an object")
+    portfolio_path = hardening.get("portfolioPath")
+    if portfolio_path != "hardening/hardening.md":
+        raise ReportProjectionError("scan hardening has an invalid portfolioPath")
+    return portfolio_path
+
+
 def _bullets(items: list[str], fallback: str) -> list[str]:
     return [f"- {item}" for item in (items or [fallback])]
 
 
 def _code_evidence_catalog(finding: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    raw = finding.get("codeEvidence", finding.get("code_evidence", []))
-    if not isinstance(raw, list):
-        return {}
-    return {
-        item["id"]: item
-        for item in raw
-        if isinstance(item, dict)
-        and isinstance(item.get("id"), str)
-        and isinstance(item.get("code"), str)
-        and item["code"].strip()
-    }
+    catalog: dict[str, dict[str, Any]] = {}
+    for key in ("codeEvidence", "code_evidence"):
+        raw = finding.get(key, [])
+        if not isinstance(raw, list):
+            continue
+        for item in raw:
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("id"), str)
+                and isinstance(item.get("code"), str)
+                and item["code"].strip()
+            ):
+                catalog.setdefault(item["id"], item)
+    return catalog
 
 
 def _section_code_evidence(
-    finding: dict[str, Any], section: dict[str, Any]
+    finding: dict[str, Any], *sections: dict[str, Any]
 ) -> list[dict[str, Any]]:
     catalog = _code_evidence_catalog(finding)
-    refs = section.get("evidenceRefs", section.get("evidence_refs", []))
-    resolved = (
-        [catalog[ref] for ref in refs if isinstance(ref, str) and ref in catalog]
-        if isinstance(refs, list)
-        else []
-    )
-    embedded = section.get("codeEvidence", section.get("code_evidence", []))
-    if isinstance(embedded, list):
-        resolved.extend(
-            item
-            for item in embedded
-            if isinstance(item, dict) and isinstance(item.get("code"), str) and item["code"].strip()
-        )
+    resolved: list[dict[str, Any]] = []
+    for section in sections:
+        for key in ("evidenceRefs", "evidence_refs"):
+            refs = section.get(key, [])
+            if isinstance(refs, str):
+                refs = [refs]
+            if isinstance(refs, list):
+                resolved.extend(
+                    catalog[ref] for ref in refs if isinstance(ref, str) and ref in catalog
+                )
+        for key in ("codeEvidence", "code_evidence"):
+            embedded = section.get(key, [])
+            if isinstance(embedded, list):
+                resolved.extend(
+                    item
+                    for item in embedded
+                    if isinstance(item, dict)
+                    and isinstance(item.get("code"), str)
+                    and item["code"].strip()
+                )
     unique: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for item in resolved:
@@ -120,6 +291,100 @@ def _section_code_evidence(
         seen.add(key)
         unique.append(item)
     return unique
+
+
+def merged_root_cause(value: dict[str, Any]) -> tuple[str | None, Any]:
+    keys = [key for key in ("rootCause", "root_cause") if key in value]
+    if not keys:
+        return None, None
+    if len(keys) == 1:
+        detail = value[keys[0]]
+        return keys[0], detail if isinstance(detail, (str, dict)) else None
+    details: list[dict[str, Any]] = []
+    for key in keys:
+        detail = value[key]
+        if isinstance(detail, str):
+            details.append({"summary": detail})
+        elif isinstance(detail, dict):
+            details.append(detail)
+        elif detail is not None:
+            continue
+    if not details:
+        return keys[0], None
+
+    merged: dict[str, Any] = {}
+    text_fields = {
+        "cause",
+        "code",
+        "description",
+        "detail",
+        "explanation",
+        "rationale",
+        "summary",
+        "why",
+    }
+    for detail in details:
+        for field, item in detail.items():
+            if field in (
+                "evidenceRefs",
+                "evidence_refs",
+                "codeEvidence",
+                "code_evidence",
+                "language",
+            ):
+                continue
+            if field in text_fields and (not isinstance(item, str) or not item.strip()):
+                continue
+            current = merged.get(field)
+            if (
+                field not in merged
+                or current in (None, "", [], {})
+                or (isinstance(current, str) and not current.strip())
+            ):
+                merged[field] = item
+
+    evidence_values = [
+        detail[field]
+        for detail in details
+        for field in ("evidenceRefs", "evidence_refs")
+        if field in detail
+    ]
+    if evidence_values:
+        merged["evidenceRefs"] = list(
+            dict.fromkeys(
+                item
+                for evidence in evidence_values
+                for item in (evidence if isinstance(evidence, list) else [evidence])
+                if isinstance(item, str)
+            )
+        )
+
+    embedded_evidence = [
+        item
+        for detail in details
+        for field in ("codeEvidence", "code_evidence")
+        for item in (detail.get(field, []) if isinstance(detail.get(field), list) else [])
+    ]
+    if embedded_evidence:
+        merged["codeEvidence"] = embedded_evidence
+
+    code = merged.get("code")
+    matching_details = (
+        details
+        if not isinstance(code, str) or not code.strip()
+        else [detail for detail in details if detail.get("code") == code]
+    )
+    language = next(
+        (
+            detail["language"]
+            for detail in matching_details
+            if isinstance(detail.get("language"), str) and detail["language"].strip()
+        ),
+        None,
+    )
+    if language is not None:
+        merged["language"] = language
+    return keys[0], merged
 
 
 def _root_cause_code_evidence(
@@ -260,34 +525,88 @@ def _surface_notes(surface: dict[str, Any]) -> str:
 
 def _finding_section(number: int, finding: dict[str, Any]) -> list[str]:
     validation = finding.get("validation") if isinstance(finding.get("validation"), dict) else {}
-    raw_root_cause = finding.get("rootCause")
+    _, raw_root_cause = merged_root_cause(finding)
     root_cause = raw_root_cause if isinstance(raw_root_cause, dict) else {}
     attack_path = finding.get("attackPath") if isinstance(finding.get("attackPath"), dict) else {}
-    dataflow = attack_path.get("dataflow") if isinstance(attack_path.get("dataflow"), dict) else {}
+    dataflow_sections = [
+        {"summary": value} if isinstance(value, str) else value
+        for key in ("dataFlow", "dataflow", "data_flow")
+        if isinstance((value := attack_path.get(key)), (str, dict))
+    ]
+    dataflow: dict[str, Any] = {}
+    for key in ("summary", "source", "sink", "outcome"):
+        value = next(
+            (
+                section[key]
+                for section in dataflow_sections
+                if key in section and isinstance(section[key], str) and section[key].strip()
+            ),
+            None,
+        )
+        if value is not None:
+            dataflow[key] = value
+    transformations = list(
+        dict.fromkeys(
+            transformation
+            for section in dataflow_sections
+            for transformation in (
+                [section.get("transformations")]
+                if isinstance(section.get("transformations"), str)
+                else section.get("transformations")
+                if isinstance(section.get("transformations"), list)
+                else []
+            )
+            if isinstance(transformation, str) and transformation.strip()
+        )
+    )
+    if transformations:
+        dataflow["transformations"] = transformations
+    raw_reachability = attack_path.get("reachability")
     reachability = (
-        attack_path.get("reachability") if isinstance(attack_path.get("reachability"), dict) else {}
+        {"summary": raw_reachability}
+        if isinstance(raw_reachability, str)
+        else raw_reachability
+        if isinstance(raw_reachability, dict)
+        else {}
     )
     severity = finding["severity"]
+    validation_outcomes = [
+        (label, text)
+        for label, key in (
+            ("Status", "status"),
+            ("Disposition", "disposition"),
+            ("Result", "result"),
+        )
+        if (text := _text(validation.get(key), ""))
+    ]
     validation_summary = _text(
         validation.get("summary"),
-        f"{finding['confidence']['rationale']} Validation details were not recorded separately.",
+        "Validation outcomes are recorded below."
+        if validation_outcomes
+        else f"{finding['confidence']['rationale']} Validation details were not recorded separately.",
     )
     validation_evidence = _strings(validation.get("evidence"))
+    validation_assertions = _strings(validation.get("assertions"))
     validation_counterevidence = _strings(validation.get("counterEvidence"))
+    validation_limitations = _strings(validation.get("limitations"))
     root_cause_summary = _text(
         raw_root_cause if isinstance(raw_root_cause, str) else root_cause.get("summary"),
         "",
     )
     root_cause_code_evidence = _root_cause_code_evidence(finding, root_cause)
     validation_code_evidence = _section_code_evidence(finding, validation)
-    attack_path_code_evidence = _section_code_evidence(finding, attack_path)
+    dataflow_code_evidence = _section_code_evidence(finding, attack_path, *dataflow_sections)
+    reachability_code_evidence = _section_code_evidence(finding, reachability)
     dataflow_summary = _text(
         dataflow.get("summary"),
         f"The canonical finding records the affected path at {_locations(finding)}, but no expanded source-to-sink narrative was recorded.",
     )
     reachability_summary = _text(
         reachability.get("summary"),
-        "Reachability was not recorded beyond the canonical finding summary and affected locations.",
+        _text(
+            attack_path.get("summary"),
+            "Reachability was not recorded beyond the canonical finding summary and affected locations.",
+        ),
     )
     severity_rationale = _text(
         severity.get("rationale"),
@@ -299,6 +618,7 @@ def _finding_section(number: int, finding: dict[str, Any]) -> list[str]:
     )
     remediation_tests = _strings(finding.get("remediationTests"))
     preventive_controls = _strings(finding.get("preventiveControls"))
+    attack_steps = _strings(attack_path.get("steps"))
     cwes = ", ".join(finding["taxonomy"]["cwe"]) or "none"
     title = _text(finding["title"], "Untitled finding")
     lines = [
@@ -327,7 +647,11 @@ def _finding_section(number: int, finding: dict[str, Any]) -> list[str]:
     lines.extend(["", "#### Validation", "", validation_summary])
     if validation.get("method"):
         lines.extend(["", f"Validation method: {_text(validation['method'], 'not recorded')}"])
+    if validation_outcomes:
+        lines.extend(["", *(f"- **{label}:** {value}" for label, value in validation_outcomes)])
     lines.extend(_code_evidence_lines(validation_code_evidence))
+    if validation_assertions:
+        lines.extend(["", "Assertions:", *_bullets(validation_assertions, "None recorded.")])
     if validation_evidence:
         lines.extend(["", "Evidence:", *_bullets(validation_evidence, "No evidence recorded.")])
     if validation_counterevidence:
@@ -338,25 +662,48 @@ def _finding_section(number: int, finding: dict[str, Any]) -> list[str]:
                 *_bullets(validation_counterevidence, "None recorded."),
             ]
         )
+    if validation_limitations:
+        lines.extend(["", "Limitations:", *_bullets(validation_limitations, "None recorded.")])
     lines.extend(["", "#### Dataflow", "", dataflow_summary])
+    if attack_steps:
+        lines.extend(["", "Attack steps:", *_bullets(attack_steps, "None recorded.")])
     for label, key in (("Source", "source"), ("Sink", "sink"), ("Outcome", "outcome")):
         if dataflow.get(key):
             lines.extend(["", f"- **{label}:** {_text(dataflow[key], 'not recorded')}"])
     transformations = _strings(dataflow.get("transformations"))
     if transformations:
         lines.extend(["", "Transformations:", *_bullets(transformations, "None recorded.")])
-    lines.extend(_code_evidence_lines(attack_path_code_evidence))
+    lines.extend(_code_evidence_lines(dataflow_code_evidence))
     lines.extend(["", "#### Reachability", "", reachability_summary])
     for label, key in (
         ("Attacker", "attacker"),
         ("Entry point", "entrypoint"),
+        ("Source", "source"),
+        ("Sink", "sink"),
         ("Outcome", "outcome"),
     ):
         if reachability.get(key):
             lines.extend(["", f"- **{label}:** {_text(reachability[key], 'not recorded')}"])
-    preconditions = _strings(reachability.get("preconditions"))
+    preconditions = list(
+        dict.fromkeys(
+            [
+                *_strings(attack_path.get("preconditions")),
+                *_strings(reachability.get("preconditions")),
+            ]
+        )
+    )
     if preconditions:
         lines.extend(["", "Preconditions:", *_bullets(preconditions, "None recorded.")])
+    for label, key in (
+        ("Assumptions", "assumptions"),
+        ("Existing controls", "controls"),
+        ("Blind spots", "blindspots"),
+        ("Limitations", "limitations"),
+    ):
+        values = _strings(attack_path.get(key))
+        if values:
+            lines.extend(["", f"{label}:", *_bullets(values, "None recorded.")])
+    lines.extend(_code_evidence_lines(reachability_code_evidence))
     lines.extend(
         [
             "",
@@ -365,6 +712,32 @@ def _finding_section(number: int, finding: dict[str, Any]) -> list[str]:
             f"**{severity['level'].capitalize()}** — {severity_rationale}",
             "",
             severity_change,
+        ]
+    )
+    for label, key in (("Impact", "impact"), ("Likelihood", "likelihood")):
+        assessment = attack_path.get(key)
+        if isinstance(assessment, str):
+            rendered = _text(assessment, "")
+            if rendered:
+                lines.extend(["", f"**{label} assessment:** {rendered}"])
+            continue
+        if not isinstance(assessment, dict):
+            continue
+        details = [
+            (detail_label, text)
+            for detail_label, detail_key in (
+                ("Level", "level"),
+                ("Rationale", "rationale"),
+                ("Why", "why"),
+            )
+            if (text := _text(assessment.get(detail_key), ""))
+        ]
+        if details:
+            lines.extend(
+                ["", f"{label} assessment:", *(f"- **{name}:** {value}" for name, value in details)]
+            )
+    lines.extend(
+        [
             "",
             "#### Remediation",
             "",
@@ -375,6 +748,29 @@ def _finding_section(number: int, finding: dict[str, Any]) -> list[str]:
         lines.extend(["", "Tests:", *_bullets(remediation_tests, "No tests recorded.")])
     if preventive_controls:
         lines.extend(["", "Preventive controls:", *_bullets(preventive_controls, "None recorded.")])
+    return lines
+
+
+def _linked_finding_section(number: int, finding: dict[str, Any], report_path: str) -> list[str]:
+    cwes = ", ".join(finding["taxonomy"]["cwe"]) or "none"
+    title = _text(finding["title"], "Untitled finding")
+    link = f"[detailed technical write-up]({report_path})"
+    lines = [
+        f'<a id="finding-{number}"></a>',
+        "",
+        f"### [{number}] {title}",
+        "",
+        "| Field | Value |",
+        "| --- | --- |",
+        f"| Severity | {_cell(finding['severity']['level'])} |",
+        f"| Confidence | {_cell(finding['confidence']['level'])} |",
+        f"| Confidence rationale | {_cell(finding['confidence']['rationale'])} |",
+        f"| Category | {_cell(finding['taxonomy']['category'])} |",
+        f"| CWE | {_cell(cwes)} |",
+        f"| Affected lines | {_cell(_locations(finding))} |",
+    ]
+    for heading in ("Summary", "Validation", "Dataflow", "Reachability", "Severity", "Remediation"):
+        lines.extend(["", f"#### {heading}", "", f"See the {link}."])
     return lines
 
 
@@ -393,6 +789,20 @@ def build_report_markdown(
         ),
         key=_finding_sort_key,
     )
+    writeup_paths = [_writeup_report_path(finding) for finding in findings]
+    duplicate_writeup_paths = sorted(
+        path
+        for path, count in Counter(path for path in writeup_paths if path is not None).items()
+        if count > 1
+    )
+    if duplicate_writeup_paths:
+        raise ReportProjectionError(
+            "reportable findings have duplicate writeup reportPath values: "
+            + ", ".join(duplicate_writeup_paths)
+        )
+    deep_presentation = _uses_deep_presentation(coverage, findings)
+    deep_finding_groups = _deep_finding_groups(findings, writeup_paths) if deep_presentation else []
+    hardening_portfolio_path = _hardening_portfolio_path(scan)
     include_paths = _strings(coverage.get("includePaths", scope.get("includePaths", [])))
     exclude_paths = _strings(coverage.get("excludePaths", scope.get("excludePaths", [])))
     limitations = _strings(scope.get("limitations"))
@@ -404,7 +814,7 @@ def build_report_markdown(
         "",
         _text(
             scope.get("summary"),
-            "The scan reviewed the canonical include paths and exclusions listed below.",
+            "The scan was configured for the include paths and exclusions listed below.",
         ),
         "",
         f"- Scan mode: {coverage['mode']}",
@@ -428,6 +838,20 @@ def build_report_markdown(
             )
     if limitations:
         lines.extend(["", "Limitations and exclusions:", *_bullets(limitations, "None recorded.")])
+    summary_count_lines = (
+        [
+            f"| Reportable DSS findings | {len(deep_finding_groups)} |",
+            f"| Report instances | {len(findings)} |",
+            f"| Report severity mix | {_severity_mix(findings)} |",
+            f"| Report confidence mix | {_confidence_mix(findings)} |",
+        ]
+        if deep_presentation
+        else [
+            f"| Reportable findings | {len(findings)} |",
+            f"| Severity mix | {_severity_mix(findings)} |",
+            f"| Confidence mix | {_confidence_mix(findings)} |",
+        ]
+    )
     lines.extend(
         [
             "",
@@ -435,9 +859,8 @@ def build_report_markdown(
             "",
             "| Field | Value |",
             "| --- | --- |",
-            f"| Reportable findings | {len(findings)} |",
-            f"| Severity mix | {_severity_mix(findings)} |",
-            f"| Confidence mix | {_confidence_mix(findings)} |",
+            f"| Scan outcome | {scan.get('status', 'completed')} |",
+            *summary_count_lines,
             f"| Coverage | {coverage['completeness']} |",
             f"| Validation mode | {_cell(scope.get('validationMode', 'not recorded'))} |",
             "",
@@ -467,11 +890,37 @@ def build_report_markdown(
             lines.extend(["", f"### {heading}", "", *_bullets(values, fallback)])
     lines.extend(["", "## Findings", ""])
     if findings:
-        lines.extend(["| Finding | Severity | Confidence |", "| --- | --- | --- |"])
-        for number, finding in enumerate(findings, 1):
-            lines.append(
-                f"| [{_link_label(finding['title'], 'Untitled finding')}](#finding-{number}) | {finding['severity']['level']} | {finding['confidence']['level']} |"
+        if deep_presentation:
+            lines.extend(
+                [
+                    "| Findings | Reports | Severity | Confidence | Detailed write-up |",
+                    "| --- | --- | --- | --- | --- |",
+                ]
             )
+            for group in deep_finding_groups:
+                lines.append(
+                    f"| {_deep_group_titles(group)} | {_deep_group_report_links(group)} "
+                    f"| {_deep_group_levels(group, 'severity', SEVERITY_ORDER)} "
+                    f"| {_deep_group_levels(group, 'confidence', CONFIDENCE_ORDER)} "
+                    f"| {_deep_group_writeup_links(group)} |"
+                )
+        else:
+            lines.extend(
+                [
+                    "| Finding | Severity | Confidence | Detailed write-up |",
+                    "| --- | --- | --- | --- |",
+                ]
+            )
+            for number, (finding, report_path) in enumerate(
+                zip(findings, writeup_paths, strict=True), 1
+            ):
+                title = _link_label(finding["title"], "Untitled finding")
+                finding_link = f"[{title}](#finding-{number})"
+                writeup_link = f"[Open report]({report_path})" if report_path else "inline below"
+                lines.append(
+                    f"| {finding_link} | {finding['severity']['level']} "
+                    f"| {finding['confidence']['level']} | {writeup_link} |"
+                )
         lines.extend(
             [
                 "",
@@ -484,14 +933,78 @@ def build_report_markdown(
                 "| low | Evidence is incomplete and the item is retained only for explicit follow-up. |",
             ]
         )
-        for number, finding in enumerate(findings, 1):
-            lines.extend(["", *_finding_section(number, finding)])
+        for number, (finding, report_path) in enumerate(
+            zip(findings, writeup_paths, strict=True), 1
+        ):
+            if report_path is not None:
+                lines.extend(["", *_linked_finding_section(number, finding, report_path)])
+            else:
+                lines.extend(["", *_finding_section(number, finding)])
     else:
+        deferred = coverage.get("deferred", [])
+        no_source_review = (
+            coverage.get("completeness") == "partial"
+            and isinstance(deferred, list)
+            and any(
+                isinstance(item, dict)
+                and item.get("reason")
+                == "The configured discovery time limit elapsed before any source review completed."
+                for item in deferred
+            )
+        )
+        budget_exhausted = (
+            coverage.get("completeness") == "partial"
+            and isinstance(deferred, list)
+            and any(
+                isinstance(item, dict)
+                and isinstance(item.get("reason"), str)
+                and (
+                    item["reason"]
+                    == "Validation was deferred because the scan reached its cost limit."
+                    or item["reason"].startswith(
+                        "Validation was deferred because the scan reached its cost limit: "
+                    )
+                )
+                for item in deferred
+            )
+        )
+        stopped = manifest.get("scan", {}).get("status") in {
+            "failed",
+            "canceled",
+            "interrupted",
+        }
         lines.extend(
             [
                 "### No findings",
                 "",
-                "No reportable findings survived the canonical discovery, validation, and reportability gates.",
+                (
+                    "No findings were retained before the scan stopped. "
+                    "The scan did not complete. No vulnerability conclusion can be drawn."
+                    if stopped
+                    else (
+                        "No source review completed before the configured time limit. "
+                        "No vulnerability conclusion can be drawn."
+                        if no_source_review
+                        else (
+                            "No findings were validated before the scan reached its cost limit. "
+                            "Review the deferred candidates in Open Questions And Follow Up."
+                            if budget_exhausted
+                            else "No reportable findings survived the canonical discovery, validation, "
+                            "and reportability gates."
+                        )
+                    )
+                ),
+            ]
+        )
+    if hardening_portfolio_path is not None:
+        lines.extend(
+            [
+                "",
+                "## Structural Hardening",
+                "",
+                "The scan also produced derived, unsealed design guidance based on the complete finding collection. These proposals describe options and tradeoffs; they do not indicate that any finding has been remediated.",
+                "",
+                f"[Open the structural hardening portfolio]({hardening_portfolio_path})",
             ]
         )
     surfaces = coverage.get("surfaces", [])
@@ -563,12 +1076,7 @@ def generate_report_markdown(
     findings: dict[str, Any],
     coverage: dict[str, Any],
 ) -> bytes:
-    markdown = build_report_markdown(manifest, findings, coverage)
-    validator = _load_script("validate_report_format")
-    errors = validator.validate_report(markdown)
-    if errors:
-        raise ReportProjectionError("generated report failed validation: " + "; ".join(errors))
-    return markdown.encode("utf-8")
+    return build_report_markdown(manifest, findings, coverage).encode("utf-8")
 
 
 def main() -> int:

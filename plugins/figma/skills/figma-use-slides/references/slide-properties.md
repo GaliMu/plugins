@@ -82,7 +82,7 @@ The speaker notes editor in Figma Slides supports a subset of markdown formattin
 The following markdown is **not supported** and will be stored as raw text (the markdown syntax characters will appear literally in the notes):
 - Headings (`# text`, `## text`)
 - Code blocks (`` `code` `` or ` ``` `)
-- Links (`[text](url)`)
+- Links (`[text](https://example.com)`)
 - Underline
 
 ## InteractiveSlideElementNode
@@ -90,9 +90,6 @@ The following markdown is **not supported** and will be stored as raw text (the 
 Interactive elements embedded in slides (polls, embeds, etc.). These are read-only — you cannot create them via the Plugin API, but you can detect and inspect them.
 
 ```js
-// Read-only inspection — skip invisible instance interiors for speed.
-figma.skipInvisibleInstanceChildren = true;
-
 const slide = figma.getNodeById("SLIDE_ID");
 const interactive = slide.findAllWithCriteria({ types: ["INTERACTIVE_SLIDE_ELEMENT"] });
 return interactive.map(n => ({
